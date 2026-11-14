@@ -1,0 +1,113 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Find newest zip
+        id: find
+        run: |
+          ZIP=$(ls DelhiBus_STEP*.zip 2>/dev/null | sort -V | tail -n 1 || true)
+          if [ -z "$ZIP" ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No DelhiBus_STEP zip in the repo yet. Nothing to build."
+            exit 0
+          fi
+          PREFIX=$(echo "$ZIP" | sed -n 's/.*_v\([0-9]*\.[0-9]*\)\..*/\1/p')
+          if [ -z "$PREFIX" ]; then PREFIX="0.1"; fi
+          rm -rf build_src
+          mkdir build_src
+          unzip -q -o "$ZIP" -d build_src
+          SETTINGS=$(find build_src -maxdepth 2 -name settings.gradle.kts | head -n 1)
+          if [ -z "$SETTINGS" ]; then
+            echo "ERROR: settings.gradle.kts not found inside $ZIP"
+            exit 1
+          fi
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+          echo "src=$(dirname "$SETTINGS")" >> "$GITHUB_OUTPUT"
+          echo "vname=$PREFIX.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "Using $ZIP -> version $PREFIX.${GITHUB_RUN_NUMBER}"
+
+      - name: Check signing secrets
+        if: steps.find.outputs.found == 'true'
+        env:
+          KS: ${{ secrets.KEYSTORE_BASE64 }}
+          KP: ${{ secrets.KEYSTORE_PASSWORD }}
+          KA: ${{ secrets.KEY_ALIAS }}
+          KEYP: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -z "$KS" ] || [ -z "$KP" ] || [ -z "$KA" ] || [ -z "$KEYP" ]; then
+            echo "ERROR: one of the 4 secrets is missing (KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD)."
+            exit 1
+          fi
+          echo "$KS" | base64 -d > "$RUNNER_TEMP/delhibus.jks"
+          keytool -list -keystore "$RUNNER_TEMP/delhibus.jks" -storepass "$KP" > /dev/null
+          echo "Signing key OK"
+
+      - name: Set up Java
+        if: steps.find.outputs.found == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Python
+        if: steps.find.outputs.found == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build Delhi data
+        if: steps.find.outputs.found == 'true'
+        working-directory: ${{ steps.find.outputs.src }}
+        env:
+          GTFS_URL: ${{ secrets.GTFS_URL }}
+        run: |
+          if [ -f tools/make_data.py ]; then python tools/make_data.py; fi
+
+      - name: Set up Gradle
+        if: steps.find.outputs.found == 'true'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build signed APK
+        if: steps.find.outputs.found == 'true'
+        working-directory: ${{ steps.find.outputs.src }}
+        env:
+          KEYSTORE_FILE: ${{ runner.temp }}/delhibus.jks
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          gradle assembleRelease --no-daemon --stacktrace \
+            -PappVersionCode=${GITHUB_RUN_NUMBER} \
+            -PappVersionName=${{ steps.find.outputs.vname }} \
+            -PgithubRepo=${{ github.repository }}
+
+      - name: Publish release
+        if: steps.find.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VNAME="${{ steps.find.outputs.vname }}"
+          APK="DelhiBus-v${VNAME}-code${GITHUB_RUN_NUMBER}.apk"
+          cp "${{ steps.find.outputs.src }}/app/build/outputs/apk/release/app-release.apk" "$APK"
+          gh release delete "v${VNAME}" --yes --cleanup-tag || true
+          gh release create "v${VNAME}" "$APK" \
+            --target "${{ github.sha }}" \
+            --title "Delhi Bus v${VNAME}" \
+            --notes "Built from ${{ steps.find.outputs.zip }} (build ${GITHUB_RUN_NUMBER})" \
+            --latest
